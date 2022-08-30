@@ -1,0 +1,2 @@
+创建ros节点的docker容器
+docker run -dit --name=fish_noetic_demo -v /home/dllr:/home/dllr -v /tmp/.X11-unix:/tmp/.X11-unix --device=/dev/dri/renderD128 -v /dev/dri:/dev/dri --device /dev/snd -e DISPLAY=unix$DISPLAY -w /home/dllr -p 11311:11311 fishros2/ros:noetic-desktop-full
