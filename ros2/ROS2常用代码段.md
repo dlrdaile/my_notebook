@@ -1,8 +1,16 @@
-# ROS2常用代码段
+# ROS2常用代码段(一)
 
 [TOC]
 
-## CMAKE编写
+## ament_cmake编写
+
+### 创建功能包
+
+```shell
+ros2 pkg create pkg_name --build-type ament_cmake
+```
+
+> 此处可以不写`--build-type`,指令默认创建的便是`ament_camke`
 
 ### 一般的编写方法
 
@@ -332,6 +340,56 @@ ament_auto_package()
   </export>
 </package>
 ```
+
+## ament_python的编写方法
+
+### 创建功能包
+
+```shell
+ros2 pkg create pkg_name --build-type ament_python
+```
+
+### 编写节点文件
+
+在`pkg_name/pkg_name`下创建`xxx.py`文件，该目录下会自动生成一个`__init__.py`文件，说明这个目录下是一个python包
+
+### 在`package.xml`中补充运行时依赖
+
+```xml
+<exec_depend>rclpy</exec_depend>
+<exec_depend>std_msgs</exec_depend>
+```
+
+> 通常写在`exec_depend`标签下即可，因为无需python`build`
+
+### 添加节点入口
+
+打开 `setup.py` ，Add the following line within the `console_scripts` brackets of the `entry_points` field:
+
+```
+entry_points={
+        'console_scripts': [
+                'talker = py_pubsub.publisher_member_function:main',
+        ],
+},
+```
+
+> 记得保存文件
+
+### 检查`setup.cfg`
+
+`setup.cfg`的文件内容应该会自动生成，如下文所示:
+
+```cfg
+[develop]
+script_dir=$base/lib/py_pubsub
+[install]
+install_scripts=$base/lib/py_pubsub
+```
+
+这个仅仅是告诉构建工具`setuptools`把你的可执行文件放到install/lib目录下(该目录为ros2 run找寻可执行库的路径)。
+
+接下来可以调用`colcon build`进行下载了，如果加上` --symlink-install`参数，则修改python文件后无需重复编译，其原理是仅仅将python的软链接映射到`install/lib`目录下。
 
 ## 话题相关
 
@@ -1376,7 +1434,55 @@ int main(int argc, char **argv)
 
 ## 动作相关
 
-> 在写动作相关的功能包前，需要先定义好动作的`interface`接口文件，action/xxxx.action，其格式可以参考[自定义接口格式处的描述](#action_msg)
+> * 在写动作相关的功能包前，需要先定义好动作的`interface`接口文件，action/xxxx.action，其格式可以参考[自定义接口格式处的描述](#action_msg)
+> * 对于动作相关的完整描述，可以查看官方的[设计文章](http://design.ros2.org/articles/actions.html)，有着具体的设计思路和使用方法解释
+
+### 动作的作用描述
+
+#### 服务端的作用
+
+- advertising the action to other ROS entities
+- accepting or rejecting goals from one or more action clients
+- executing the action when a goal is received and accepted
+- optionally providing feedback about the progress of all executing actions
+- optionally handling requests to cancel one or more actions
+- sending the result of a completed action, including whether it succeeded, failed, or was canceled, to a client that makes a result request.
+
+#### 客户端的作用
+
+- sending goals to the action server
+- optionally monitoring the user-defined feedback for goals from the action server
+- optionally monitoring the current state of accepted goals from the action server (see [Goal States](http://design.ros2.org/articles/actions.html#goal-states))
+- optionally requesting that the action server cancel an active goal
+- optionally checking the result for a goal received from the action server
+
+#### 状态过程描述
+
+![Action Goal State Machine](/home/dllr/Desktop/notebook/ros2/ROS2常用代码段.assets/goal_state_machine.png)
+
+有三个活动状态:
+
+- **ACCEPTED** - 目标已经被接受并等待执行
+- **EXECUTING** - 目标正在被动作服务器执行
+- **CANCELING** - 客户端请求取消动作，并且服务端接受了取消的请求. This state is useful for any user-defined “clean up” that the action server may have to do.
+
+此外，还有三个最终状态(客户端在result回调函数中可接受的状态):
+
+- **SUCCEEDED** - 服务端成功的完成了目标.
+- **ABORTED** - 目标在没有外部取消请求的情况下被服务端终止了.
+- **CANCELED** - 目标在一个客户端的取消请求后成功的终止了.
+
+状态转移发生在服务端中，其转移的触发时机由具体的代码实现决定:
+
+- **execute** - 开始执行一个目标.
+- **succeed** - 通知说明一个动作被成功的完成了.
+- **abort** - 通知说明在执行目标的过程中出现了某种错误，不得不终止动作的执行.
+- **canceled** - 通知说明动作被客户端申请取消，且服务端同意申请，动作已经被取消了.
+
+在客户端可以调用下列两个函数触发动作过程的状态变化:
+
+- **send_goal** - 一个目标被送到服务端，只有当服务端接受该目标请求时，状态机才会开始工作.
+- **cancel_goal** - 请求服务端取消目标的执行. ，只有当服务端接受了终止请求，状态才会发生转移.
 
 ### CPP实现
 
@@ -1524,11 +1630,362 @@ RCLCPP_COMPONENTS_REGISTER_NODE(action_tutorials_cpp::FibonacciActionServer)
 
 #### 动作客户端
 
+> 动作客户端的功能包依赖和服务端是一样的，所以可以在同一个工作包下进行编写
+
+##### 编写客户端代码
+
+###### 一个动作客户端有三个重要的事情:
+
+1. The templated action type name: `Fibonacci`.
+2. A ROS 2 node to add the action client to: `this`.
+3. The action name: `'fibonacci'`.
+
+###### 代码
+
+```cpp
+#include <functional>
+#include <future>
+#include <memory>
+#include <string>
+#include <sstream>
+
+#include "action_tutorials_interfaces/action/fibonacci.hpp"
+
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
+
+namespace action_tutorials_cpp
+{
+class FibonacciActionClient : public rclcpp::Node
+{
+public:
+  using Fibonacci = action_tutorials_interfaces::action::Fibonacci;
+  using GoalHandleFibonacci = rclcpp_action::ClientGoalHandle<Fibonacci>;
+
+  explicit FibonacciActionClient(const rclcpp::NodeOptions & options)
+  : Node("fibonacci_action_client", options)
+  {
+    this->client_ptr_ = rclcpp_action::create_client<Fibonacci>(
+      this,
+      "fibonacci");
+
+    this->timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(500),
+      std::bind(&FibonacciActionClient::send_goal, this));
+  }
+
+  void send_goal()
+  {
+    using namespace std::placeholders;
+
+    this->timer_->cancel();
+
+    if (!this->client_ptr_->wait_for_action_server()) {
+      RCLCPP_ERROR(this->get_logger(), "Action server not available after waiting");
+      rclcpp::shutdown();
+    }
+
+    auto goal_msg = Fibonacci::Goal();
+    goal_msg.order = 10;
+
+    RCLCPP_INFO(this->get_logger(), "Sending goal");
+
+    auto send_goal_options = rclcpp_action::Client<Fibonacci>::SendGoalOptions();
+    send_goal_options.goal_response_callback =
+      std::bind(&FibonacciActionClient::goal_response_callback, this, _1);
+    send_goal_options.feedback_callback =
+      std::bind(&FibonacciActionClient::feedback_callback, this, _1, _2);
+    send_goal_options.result_callback =
+      std::bind(&FibonacciActionClient::result_callback, this, _1);
+    this->client_ptr_->async_send_goal(goal_msg, send_goal_options);
+  }
+
+private:
+  rclcpp_action::Client<Fibonacci>::SharedPtr client_ptr_;
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  void goal_response_callback(const GoalHandleFibonacci::SharedPtr & goal_handle)
+  {
+    if (!goal_handle) {
+      RCLCPP_ERROR(this->get_logger(), "Goal was rejected by server");
+    } else {
+      RCLCPP_INFO(this->get_logger(), "Goal accepted by server, waiting for result");
+    }
+  }
+
+  void feedback_callback(
+    GoalHandleFibonacci::SharedPtr,
+    const std::shared_ptr<const Fibonacci::Feedback> feedback)
+  {
+    std::stringstream ss;
+    ss << "Next number in sequence received: ";
+    for (auto number : feedback->partial_sequence) {
+      ss << number << " ";
+    }
+    RCLCPP_INFO(this->get_logger(), ss.str().c_str());
+  }
+
+  void result_callback(const GoalHandleFibonacci::WrappedResult & result)
+  {
+    switch (result.code) {
+      case rclcpp_action::ResultCode::SUCCEEDED:
+        break;
+      case rclcpp_action::ResultCode::ABORTED:
+        RCLCPP_ERROR(this->get_logger(), "Goal was aborted");
+        return;
+      case rclcpp_action::ResultCode::CANCELED:
+        RCLCPP_ERROR(this->get_logger(), "Goal was canceled");
+        return;
+      default:
+        RCLCPP_ERROR(this->get_logger(), "Unknown result code");
+        return;
+    }
+    std::stringstream ss;
+    ss << "Result received: ";
+    for (auto number : result.result->sequence) {
+      ss << number << " ";
+    }
+    RCLCPP_INFO(this->get_logger(), ss.str().c_str());
+    rclcpp::shutdown();
+  }
+};  // class FibonacciActionClient
+
+}  // namespace action_tutorials_cpp
+
+RCLCPP_COMPONENTS_REGISTER_NODE(action_tutorials_cpp::FibonacciActionClient)
+```
+
+> **关键代码：**
+>
+> * 创建客户端对象，传入其`动作接口类型`、`所属节点`、`动作名称`:
+>
+>   ```cpp
+>   this->client_ptr_ = rclcpp_action::create_client<Fibonacci>(
+>         this,
+>         "fibonacci");
+>   ```
+>
+> * 发送目标`send_goal()`:
+>   * 创建目标消息：`auto goal_msg = Fibonacci::Goal()`
+>   * 如果要监测动作过程的`feedback`、`result`等，需要配置`auto send_goal_options = rclcpp_action::Client<Fibonacci>::SendGoalOptions();`
+>   * 发送目标，建议使用异步发送`this->client_ptr_->async_send_goal(goal_msg, send_goal_options);`
+>
+> > 注意自定义的监测函数的参数定义和类型
+> >
+> > * `goal_response_callback`：监测目标发送是否被接受
+> >
+> >   ```cpp
+> >     void goal_response_callback(const GoalHandleFibonacci::SharedPtr & goal_handle)
+> >     {
+> >       if (!goal_handle) {
+> >         RCLCPP_ERROR(this->get_logger(), "Goal was rejected by server");
+> >       } else {
+> >         RCLCPP_INFO(this->get_logger(), "Goal accepted by server, waiting for result");
+> >       }
+> >     }
+> >   ```
+> >
+> > * `feedback_callback`:监测动作的反馈过程，在导航和连续作业中很重要
+> >
+> >   ```cpp
+> >     void feedback_callback(
+> >       GoalHandleFibonacci::SharedPtr,
+> >       const std::shared_ptr<const Fibonacci::Feedback> feedback)
+> >     {
+> >       std::stringstream ss;
+> >       ss << "Next number in sequence received: ";
+> >       for (auto number : feedback->partial_sequence) {
+> >         ss << number << " ";
+> >       }
+> >       RCLCPP_INFO(this->get_logger(), ss.str().c_str());
+> >     }
+> >   ```
+> >
+> > * `result_callback`:查看当前动作的完成情况，其中
+> >
+> >   * `rclcpp_action::ResultCode::ABORTED`：表示目标被中止了，通常是非用户取消而服务端异常等情况下反馈的最终执行状态
+> >   * `rclcpp_action::ResultCode::CANCELED`：表示目标被客户端取消了，通常是用户手动取消目标是反馈的最终执行状态
+> >   * `rclcpp_action::ResultCode::SUCCEEDED`：表示目标成功执行，并返回最终结果
+> >
+> >   ```cpp
+> >     void result_callback(const GoalHandleFibonacci::WrappedResult & result)
+> >     {
+> >       switch (result.code) {
+> >         case rclcpp_action::ResultCode::SUCCEEDED:
+> >           break;
+> >         case rclcpp_action::ResultCode::ABORTED:
+> >           RCLCPP_ERROR(this->get_logger(), "Goal was aborted");
+> >           return;
+> >         case rclcpp_action::ResultCode::CANCELED:
+> >           RCLCPP_ERROR(this->get_logger(), "Goal was canceled");
+> >           return;
+> >         default:
+> >           RCLCPP_ERROR(this->get_logger(), "Unknown result code");
+> >           return;
+> >       }
+> >       std::stringstream ss;
+> >       ss << "Result received: ";
+> >       for (auto number : result.result->sequence) {
+> >         ss << number << " ";
+> >       }
+> >       RCLCPP_INFO(this->get_logger(), ss.str().c_str());
+> >       rclcpp::shutdown();
+> >     }
+> >   };  // class FibonacciActionClient
+> >   ```
+
 ### Python实现
 
 #### 动作服务器
 
+```python
+import time
+
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.node import Node
+
+from action_tutorials_interfaces.action import Fibonacci
+
+
+class FibonacciActionServer(Node):
+
+    def __init__(self):
+        super().__init__('fibonacci_action_server')
+        self._action_server = ActionServer(
+            self,
+            Fibonacci,
+            'fibonacci',
+            self.execute_callback)
+
+    def execute_callback(self, goal_handle):
+        self.get_logger().info('Executing goal...')
+
+        feedback_msg = Fibonacci.Feedback()
+
+        feedback_msg.partial_sequence = [0, 1]
+
+        for i in range(1, goal_handle.request.order):
+            feedback_msg.partial_sequence.append(
+
+                feedback_msg.partial_sequence[i] + feedback_msg.partial_sequence[i - 1])
+
+            self.get_logger().info('Feedback: {0}'.format(feedback_msg.partial_sequence))
+
+            goal_handle.publish_feedback(feedback_msg)
+
+            time.sleep(1)
+
+        goal_handle.succeed()
+
+        result = Fibonacci.Result()
+
+        result.sequence = feedback_msg.partial_sequence
+
+        return result
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    fibonacci_action_server = FibonacciActionServer()
+
+    rclpy.spin(fibonacci_action_server)
+
+
+if __name__ == '__main__':
+    main()
+
+```
+
+> **关键代码：**
+>
+> * 创建服务服务器对象，此处仅仅给出了执行过程的回调函数，但和cpp一样，在python中也可以给出接受目标的回调函数以及拒绝目标的回调函数
+>
+> ```python
+> self._action_server = ActionServer(
+>     self,
+>     Fibonacci,
+>     'fibonacci',
+>     self.execute_callback)
+> ```
+
 #### 动作客户端
+
+```python
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+
+from action_tutorials_interfaces.action import Fibonacci
+
+
+class FibonacciActionClient(Node):
+
+    def __init__(self):
+        super().__init__('fibonacci_action_client')
+        self._action_client = ActionClient(self, Fibonacci, 'fibonacci')
+
+    def send_goal(self, order):
+        goal_msg = Fibonacci.Goal()
+        goal_msg.order = order
+
+        self._action_client.wait_for_server()
+
+        self._send_goal_future = self._action_client.send_goal_async(goal_msg)
+
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected :(')
+            return
+
+        self.get_logger().info('Goal accepted :)')
+
+        self._get_result_future = goal_handle.get_result_async()
+        self._get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info('Result: {0}'.format(result.sequence))
+        rclpy.shutdown()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    action_client = FibonacciActionClient()
+
+    action_client.send_goal(10)
+
+    rclpy.spin(action_client)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+> **关键代码：**
+>
+> * 创建客户端对象：`self._action_client = ActionClient(self, Fibonacci, 'fibonacci')`
+>
+> * 发送目标时等待`response`，此处注意，在调用`send_goal_async`时可以传入`feedback_callback`函数
+>
+>   ```python
+>   self._send_goal_future = self._action_client.send_goal_async(goal_msg)
+>   
+>   self._send_goal_future.add_done_callback(self.goal_response_callback)
+>   ```
+>
+> * 当获得响应时调用
+>
+>   ```python
+>   self._get_result_future = goal_handle.get_result_async()
+>   self._get_result_future.add_done_callback(self.get_result_callback)
+>   ```
 
 ## pluginlib的编写方法
 
